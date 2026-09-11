@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
+
+from main import MathEnv, run_cli
 
 from benchmax.envs import (
     BaseRollout,
@@ -12,13 +15,15 @@ from benchmax.envs import (
     Example,
     JsonRow,
     RolloutFailure,
+    RolloutOutcome,
     RolloutRequest,
     canonical_example_id,
 )
-from main import MathEnv, run_cli
 
 FAILURE_KEY = "_stress_failure"
+SCENARIOS = ("cycle", "partial_sibling", "all_siblings_empty")
 FAILURE_MODES = (
+    "partial_sibling",
     "crash_once",
     "init_rollout",
     "run_tool",
@@ -29,12 +34,16 @@ FAILURE_MODES = (
 
 
 class StressTestMathEnv(MathEnv):
-    """Cycle failures through the dataset while keeping its first row healthy."""
+    """Inject a selected failure pattern while keeping item zero healthy."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, scenario: str = "cycle") -> None:
         super().__init__()
+        if scenario not in SCENARIOS:
+            raise ValueError(f"unknown stress scenario: {scenario}")
+        self._scenario = scenario
         self._active_failures: dict[str, str] = {}
         self._crashed_examples: set[str] = set()
+        self._partial_sibling_failures: set[str] = set()
 
     async def create_dataset(
         self,
@@ -51,8 +60,9 @@ class StressTestMathEnv(MathEnv):
         examples: list[Example[JsonRow]] = []
         for index, example in enumerate(dataset):
             payload = dict(example.payload)
-            if index:
-                payload[FAILURE_KEY] = FAILURE_MODES[(index - 1) % len(FAILURE_MODES)]
+            failure = self._failure_for_index(index)
+            if failure is not None:
+                payload[FAILURE_KEY] = failure
             examples.append(
                 Example(
                     id=canonical_example_id(payload),
@@ -61,11 +71,41 @@ class StressTestMathEnv(MathEnv):
             )
         return Dataset(examples)
 
+    def _failure_for_index(self, index: int) -> str | None:
+        if index == 0:
+            return None  # Validation always selects one healthy example.
+        if self._scenario == "partial_sibling":
+            return "partial_sibling" if index == 1 else None
+        if self._scenario == "all_siblings_empty":
+            return "init_rollout" if index <= 3 else None
+        return FAILURE_MODES[(index - 1) % len(FAILURE_MODES)]
+
+    async def run_group(
+        self,
+        requests: Sequence[RolloutRequest[JsonRow]],
+    ) -> Mapping[str, RolloutOutcome]:
+        """Fail only the first sibling for a partial-sibling stress example."""
+
+        victim = None
+        if requests and requests[0].example.payload.get(FAILURE_KEY) == "partial_sibling":
+            victim = requests[0].rollout_id
+            self._partial_sibling_failures.add(victim)
+        try:
+            return await super().run_group(requests)
+        finally:
+            if victim is not None:
+                self._partial_sibling_failures.discard(victim)
+
     async def run_rollout(
         self,
         request: RolloutRequest[JsonRow],
     ) -> BaseRollout:
         failure = request.example.payload.get(FAILURE_KEY)
+        if failure == "partial_sibling" and request.rollout_id in self._partial_sibling_failures:
+            raise RolloutFailure(
+                "harness_error",
+                "stress test: partial sibling failed before model execution",
+            )
         if failure == "crash_once" and request.example.id not in self._crashed_examples:
             self._crashed_examples.add(request.example.id)
             raise RuntimeError("stress test: crash once before model execution")
@@ -89,6 +129,10 @@ class StressTestMathEnv(MathEnv):
         return await super().run_tool(rollout_id, tool_name, **tool_args)
 
     async def compute_reward(self, rollout: BaseRollout) -> dict[str, float]:
+        if self._scenario != "cycle" or rollout.example_args.get(FAILURE_KEY) == "partial_sibling":
+            # Scenario runs test orchestration rather than model quality. Keep
+            # every token-bearing group out of reward rerolling.
+            return {"correctness": 1.0}
         if rollout.example_args.get(FAILURE_KEY) == "compute_reward":
             raise RolloutFailure("judge_error", "stress test: reward service failed")
         return await super().compute_reward(rollout)
@@ -135,5 +179,17 @@ class _StressRolloutContext:
             )
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--scenario", choices=SCENARIOS, default="cycle")
+    scenario_args, remaining = parser.parse_known_args(argv)
+    return run_cli(
+        StressTestMathEnv,
+        run_name=f"math-stress-{scenario_args.scenario.replace('_', '-')}",
+        constructor_args={"scenario": scenario_args.scenario},
+        argv=remaining,
+    )
+
+
 if __name__ == "__main__":
-    sys.exit(run_cli(StressTestMathEnv, run_name="math-stress"))
+    sys.exit(main())

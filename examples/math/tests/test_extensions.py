@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from benchmax.envs import BaseRollout, Example, RolloutFailure, canonical_example_id
+from benchmax.auth import StaticBearerAuth
 from extensions.math_group_env import MathGroupEnv
 from extensions.stress_test_env import (
     FAILURE_KEY,
@@ -13,6 +14,8 @@ from extensions.stress_test_env import (
     StressTestMathEnv,
 )
 from main import MathEnv
+
+from benchmax.envs import BaseRollout, Example, RolloutFailure, RolloutRequest, canonical_example_id
 
 
 def _write_rows(path: Path, count: int) -> None:
@@ -83,6 +86,34 @@ async def test_stress_dataset_keeps_first_example_healthy_then_cycles_failures(
 
 
 @pytest.mark.asyncio
+async def test_stress_scenarios_isolate_the_requested_failure(tmp_path: Path) -> None:
+    _write_rows(tmp_path / "train.jsonl", 6)
+
+    partial = await StressTestMathEnv(scenario="partial_sibling").create_dataset("train", tmp_path)
+    all_empty = await StressTestMathEnv(scenario="all_siblings_empty").create_dataset(
+        "train",
+        tmp_path,
+    )
+
+    assert [example.payload.get(FAILURE_KEY) for example in partial] == [
+        None,
+        "partial_sibling",
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert [example.payload.get(FAILURE_KEY) for example in all_empty] == [
+        None,
+        "init_rollout",
+        "init_rollout",
+        "init_rollout",
+        None,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stress_context_and_reward_failures_are_labeled() -> None:
     env = StressTestMathEnv()
 
@@ -126,3 +157,63 @@ async def test_stress_crash_happens_once_then_recovers(monkeypatch) -> None:
 
     recovered = await env.run_rollout(request)
     assert recovered.termination_reason == "finished"
+
+
+@pytest.mark.asyncio
+async def test_stress_partial_sibling_settles_only_first_member(monkeypatch) -> None:
+    env = StressTestMathEnv()
+    example = _example("partial_sibling")
+    requests = [
+        RolloutRequest(
+            rollout_id=rollout_id,
+            example=example,
+            model="test-model",
+            base_url=f"http://model.test/sessions/{rollout_id}/v1",
+            model_auth=StaticBearerAuth(f"key-{rollout_id}"),
+        )
+        for rollout_id in ("failed-sibling", "successful-sibling")
+    ]
+
+    async def successful_rollout(self, request):
+        return replace(
+            _rollout(request.rollout_id, failure="partial_sibling"),
+            rewards={"correctness": 1.0},
+        )
+
+    monkeypatch.setattr(MathEnv, "run_rollout", successful_rollout)
+
+    outcomes = await env.run_group(requests)
+
+    assert outcomes["failed-sibling"].termination_reason == "harness_error"
+    assert outcomes["failed-sibling"].rewards == {}
+    assert outcomes["failed-sibling"].error == (
+        "stress test: partial sibling failed before model execution"
+    )
+    assert outcomes["successful-sibling"].termination_reason == "finished"
+    assert outcomes["successful-sibling"].rewards == {"correctness": 1.0}
+    assert outcomes["successful-sibling"].error is None
+
+
+@pytest.mark.asyncio
+async def test_stress_all_siblings_empty_settles_every_member() -> None:
+    env = StressTestMathEnv(scenario="all_siblings_empty")
+    example = _example("init_rollout")
+    requests = [
+        RolloutRequest(
+            rollout_id=rollout_id,
+            example=example,
+            model="test-model",
+            base_url=f"http://model.test/sessions/{rollout_id}/v1",
+            model_auth=StaticBearerAuth(f"key-{rollout_id}"),
+        )
+        for rollout_id in ("empty-a", "empty-b")
+    ]
+
+    outcomes = await env.run_group(requests)
+
+    assert set(outcomes) == {"empty-a", "empty-b"}
+    assert all(outcome.termination_reason == "harness_error" for outcome in outcomes.values())
+    assert all(outcome.rewards == {} for outcome in outcomes.values())
+    assert all(
+        outcome.error == "stress test: rollout setup failed" for outcome in outcomes.values()
+    )
