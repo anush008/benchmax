@@ -129,10 +129,6 @@ class StressTestMathEnv(MathEnv):
         return await super().run_tool(rollout_id, tool_name, **tool_args)
 
     async def compute_reward(self, rollout: BaseRollout) -> dict[str, float]:
-        if self._scenario != "cycle" or rollout.example_args.get(FAILURE_KEY) == "partial_sibling":
-            # Scenario runs test orchestration rather than model quality. Keep
-            # every token-bearing group out of reward rerolling.
-            return {"correctness": 1.0}
         if rollout.example_args.get(FAILURE_KEY) == "compute_reward":
             raise RolloutFailure("judge_error", "stress test: reward service failed")
         return await super().compute_reward(rollout)

@@ -114,6 +114,22 @@ async def test_stress_scenarios_isolate_the_requested_failure(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_partial_sibling_scenario_uses_normal_math_rewards() -> None:
+    env = StressTestMathEnv(scenario="partial_sibling")
+    correct = _rollout("correct", failure="partial_sibling")
+    incorrect = replace(
+        _rollout("incorrect", failure="partial_sibling"),
+        messages=[
+            {"role": "assistant", "tool_calls": [{"id": "call", "type": "function"}]},
+            {"role": "assistant", "content": "<answer>41</answer>"},
+        ],
+    )
+
+    assert await env.compute_reward(correct) == {"correctness": 1.0}
+    assert await env.compute_reward(incorrect) == {"correctness": 0.0}
+
+
+@pytest.mark.asyncio
 async def test_stress_context_and_reward_failures_are_labeled() -> None:
     env = StressTestMathEnv()
 
